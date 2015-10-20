@@ -680,10 +680,10 @@ function posterior_vec = jc_posterior_ng(N)
     k = sum(sum(diagonal));
     p = exp(- DistSamples ./ 100);
 
-    likelihood = binomial_pdf(k, tot, p);
+    likelihood = binopdf(k, tot, p);
     if (any(isnan(likelihood)))
       # In case the binomial is tricky to compute, approx with normal distr!
-      likelihood = normal_pdf(k, tot .* p, tot .* p .* (1 .- p)); 
+      likelihood = normpdf(k, tot .* p, tot .* p .* (1 .- p)); 
     endif
 
     n = columns(DistSamples);
