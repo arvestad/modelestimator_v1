@@ -1,0 +1,940 @@
+#! /usr/bin/perl -w
+
+#
+# Global variables
+#
+my @ALPHABET = (A, R, N, D, C, Q, E, G, H, I, L, K, M, F, P, S, T, W, Y, V);
+
+my $MinSpeed = 1;
+my $MaxSpeed = 10;
+
+my $progname = 'modelestimator';		# Application name
+my $version = '1.1';
+
+#
+# Global options
+#
+my $verbose = 0;
+my $threshold = 0.001;
+my $output_format = 'Q';
+my $speed = 5;			# Decides the spacing of samples in Octave
+my $octave = 'octave';
+my $prior = "flat_prior";
+my $debug = 0;			# If 1, write octave commands to output instead of to an octave process.
+
+my $usage = "Usage: $progname [<options>] <infile> [<outfile>]
+
+The infile should be in either FASTA, STOCKHOLM, or PHYLIP format.
+Output is a rate matrix and residue distribution vector, both in Octave/Matlab
+format.
+
+Options:
+   -indels        Remove gap columns. A gap can is denoted by '-'.
+
+   -threshold <f> Stop when consecutive iterations do not change by more
+                  than <f>. Default is $threshold.
+
+   -paml          Output model for use with PAML.
+   -fasta         Output substitution matrix (Pam250) for use with FastA.
+
+   -v             Verbose. Show progress info on STDERR.
+   -octave <path> Point to the Octave binary to run. '$octave' by default.
+   -d             Debug option. Output Octave commands to STDOUT.
+
+   -version       Show version information.
+   -u, -h         This help text.
+";
+
+
+#
+# Reading sequence files
+#
+sub read_input {
+  my ($filename) = @_;
+
+  open(F, "<$filename")
+    or die "Could not open $filename for reading!\n";
+
+  my $format = 'fasta';
+
+  my $seq_no = 0;
+  my %seqs = ();
+  my @seqnames = ();		# The seqnames are put here to preserve order
+  my $seq = undef;
+  my $line=0;
+  my %len_db = ();		# Store seqlengths for input checking
+
+  while (<F>) {
+    $line++;
+    chomp;
+    if (length($_) == 0) {
+      next;
+    }
+    if ($line == 1) {
+      if (m/\d+\s+\d+/) {
+	$format = 'phylip';
+	next;
+      } elsif (m/^\#\s*STOCKHOLM\s+1.0\s*$/i) {
+	$format = 'stockholm';
+	next;
+      } elsif (m/^[^\#]\S+\s+\S+$/) {
+	$format = 'stockholm';
+      }
+    }
+
+    if ($format eq 'phylip') {
+      if (m/^(\S+)\s+(\S+)$/) {
+	push @seqnames, $1;
+	push @{$len_db{length($2)}}, $1;
+	$seqs{$1} = $2;
+      }
+    } elsif ($format eq 'stockholm') {
+      if (m/^\#/) {
+	next;
+      } elsif (m/\/\//) {
+	last;
+      } elsif (m/^(\S+)\s+(\S+)$/) {
+	if (exists $seqs{$1}) {
+	  $seqs{$1} .= $2;
+	} else {
+	  push @seqnames, $1;
+	  $seqs{$1} = $2;
+	}
+      }
+    } else {			# fasta
+      if (m/^(\#|>\s*)(\S+)/) {
+	if (defined $seq) {
+	  $seqs{$curname} = $seq;
+	  push @seqnames, $curname;
+	  push @{$len_db{length($seq)}}, $curname;
+	}
+	$seq_no++;
+	$seq = '';
+	$curname = $2;
+      } elsif (m/^([-.a-zA-Z]+)\s*$/) {
+	$seq .= $1;
+      } else {
+	print STDERR "Garbage in input on line $line: '$_'\n";
+	exit 1;
+      }
+    }
+  }
+  if (defined $seq) {
+    $seqs{$curname} = $seq;
+    push @seqnames, $curname;
+    push @{$len_db{length($seq)}}, $curname;
+  }
+  close(F);
+
+  if ($format eq 'stockholm') {
+    foreach my $sid (keys %seqs) {
+      push @{$len_db{length($seqs{$sid})}}, $sid;
+    }
+  }
+
+  if (scalar(keys(%len_db)) > 1) {
+    foreach my $len (keys %len_db) {
+      print "Length = $len:\t", join(', ', @{$len_db{$len}}), "\n";
+    }
+    die "Sequence lengths are not agreeing. Make sure all sequences are aligned.";
+  }
+
+  return (\%seqs, \@seqnames);
+}
+
+#
+# Remove gap columns
+#
+sub remove_gaps {
+  my ($seqs) = @_;
+
+  # First find the actual gap columns
+  my %gap_db = ();
+  for my $name (keys %$seqs) {
+    my $pos = -1;
+    my $s = $seqs->{$name};
+    while (($pos = index($s, '-', $pos)) > -1) {
+      $gap_db{$pos} = undef;
+      $pos++;
+    }
+  }
+
+  # Remove those bad columns
+  my @gap_positions = sort {$b <=> $a} keys %gap_db;
+  foreach my $name (keys %$seqs) {
+    foreach my $pos (@gap_positions) {
+      substr($seqs->{$name}, $pos, 1, '');
+    }
+  }
+}
+
+
+#
+# Compute a count matrix, and identity. The id measure might be biased
+# by gaps and stuff, but I don't care. It is not important for what
+# I have in mind.
+#
+sub count_replacements {
+  my ($s1, $s2) = @_;
+  my %M = ();
+
+  my $n = 0;
+  for (my $i = 0; $i < length($s1); $i++) {
+    my $c1 = uc(substr($s1, $i, 1));
+    my $c2 = uc(substr($s2, $i, 1));
+    $M{$c1}{$c2}++;
+    if ($c1 eq $c2) {
+      $n++;
+    }
+  }
+
+  return (\%M, 100 * $n / length($s1));
+}
+
+
+#
+# Compute all count matrices
+#
+sub count_for_all_pairs {
+  my ($seqs, $names) = @_;
+
+  # The following is a matrix with references to count matrices
+  my %counts = ();
+  my %identities = ();
+
+  my $nseqs = scalar(@$names);
+  for (my $i = 0; $i < $nseqs - 1; $i++) {
+    for (my $j = $i + 1; $j < $nseqs; $j++) {
+      my $n1 = $names->[$i];
+      my $n2 = $names->[$j];
+      my ($cm, $id) = count_replacements($seqs->{$n1}, $seqs->{$n2});
+      $counts{$i}{$j} = $cm;
+      $identities{$n1}{$n2} = $id;
+#      print STDERR "($i, $j) $n1, $n2: $id\n";
+    }
+  }
+
+  return (\%counts, \%identities);
+}
+			
+
+
+
+#
+# Basic Octave initialization
+#
+sub write_octave_prologue {
+  my ($fh) = @_;
+
+  print $fh "PS1=\"> \";split_long_rows=0;more off;format long\n";
+#  print $fh "StepSize = $speed;\n";
+
+  while (<DATA>) {
+    print $fh $_;
+  }
+
+  print $fh "L = \{\};\n";
+}
+
+sub write_octave_commands {
+  my ($fh, $seqs, $names) = @_;
+
+  my $nseqs = scalar(@$names);
+
+  my ($counts, $ids) = count_for_all_pairs($seqs, $names);
+
+  my %pairs = ();
+  my %pair_id = ();
+  my %ids = ();
+
+  for (my $i = 0; $i < $nseqs-1; $i++) {
+    $ids{$i} = undef;
+    for (my $j = $i+1; $j < $nseqs; $j++) {
+      my $n1 = $names->[$i];
+      my $n2 = $names->[$j];
+
+      my $str = "$n1 $n2";
+      $pairs{$str} = [$i, $j];
+      $pair_id{$str} = $ids->{$n1}{$n2};
+    }
+  }
+
+  my @by_identity = sort {$pair_id{$b} <=> $pair_id{$a}} keys %pair_id;
+  my $too_alike = 0;
+  my @chosen = ();
+  foreach my $p (@by_identity) {
+    if ($pair_id{$p} == 100) {
+      $too_alike++;
+    } else {
+      my $pair = $pairs{$p};
+      my $a = $pair->[0];
+      my $b = $pair->[1];
+      if ((exists $ids{$a}) && (exists $ids{$b})) {
+	delete $ids{$a};
+	delete $ids{$b};
+	print $fh "N = [\n";
+	print_count_matrix($fh, $counts->{$a}{$b});
+	print $fh "];\nL = cat(2, L, {N});\n";
+      }
+    }
+  }
+}
+
+sub write_octave_ending {
+  my ($fh) = @_;
+
+  print $fh "[Q eq dv] = IterativeEstimation(L, $threshold);\n";
+
+  if ($output_format eq 'paml') {
+    print $fh "write_for_paml(Q, eq);\ndisp('');\n";
+    print $fh "disp('// End of PAML input');\n";
+    print $fh "disp('This model was estimated by modelestimator,');\n";
+    print $fh "disp('written by Lars Arvestad <arve\@csc.kth.se>, http://www.csc.kth.se/~arve.');\n";
+  } elsif ($output_format eq 'fasta') {
+    print $fh "disp('# This matrix was estimated by modelestimator,');\n";
+    print $fh "disp('# written by Lars Arvestad <arve\@csc.kth.se>, http://www.csc.kth.se/~arve.');\n";
+    print $fh "write_pam(Q, eq, 250);\ndisp('');\n";
+  } else {
+    print $fh "disp('Q =[');\n";
+    print $fh "disp(Q);\n";
+    print $fh "disp('];');\n";
+
+    print $fh "disp('eq =[');\n";
+    print $fh "disp(eq);\n";
+    print $fh "disp('];');\n";
+  }
+}
+
+sub print_count_matrix {
+  my ($fh, $counts) = @_;
+
+  foreach my $aminoacid1 (@ALPHABET) {
+    foreach my $aminoacid2 (@ALPHABET) {
+      if (exists $counts->{$aminoacid1}{$aminoacid2}) {
+	print $fh $counts->{$aminoacid1}{$aminoacid2}, "  ";
+      } else {
+	print $fh "0  ";
+      }
+    }
+    print $fh "\n";
+  }
+}
+
+### Main program ###
+
+
+if (@ARGV < 1) {
+  print STDERR $usage;
+  exit 2;
+}
+
+my $remove_indel_columns = 0;
+
+while (substr($ARGV[0], 0, 1) eq '-') {
+  my $option = shift @ARGV;
+  if ($option eq '-indels') {
+    $remove_indel_columns = 1;
+  } elsif ($option eq '-s') {	# Speed, which affects precision, 
+    $speed = shift @ARGV;
+    if ($speed =~ m/^\d+$/) {
+      if ($speed < 1 || $speed > 10) {
+	print STDERR "$progname error: Invalid range for '-s' option. Speed must be in [$MinSpeed, $MaxSpeed].\nComputation aborted.\n";
+	exit 5;
+      }
+    } else {
+      print STDERR "$progname error: The argument to '-s' must be an integer, found '$speed'.\n";
+      exit 6;
+    }
+  } elsif ($option eq '-t' || $option eq '-threshold') {
+    if (@ARGV > 1) {
+      $option = shift @ARGV;
+      if ($option =~ m/0.\d+/) {
+	$threshold = $option;
+      } else {
+	print STDERR "Illegal value for -threshold: '$option'\n";
+	exit 9;
+      }
+    }
+  } elsif ($option eq '-paml') {
+    $output_format = 'paml';
+  } elsif ($option eq '-fasta'){ 
+    $output_format = 'fasta';
+  } elsif ($option eq '-octave') {
+    $octave = shift @ARGV;
+  } elsif ($option eq '-v') {
+    $verbose = 1;
+  } elsif ($option eq '-d') {
+    $debug = 1;
+  } elsif ($option eq '-version') {
+    print "Version $version\n";
+    exit 0;
+  } elsif ($option eq '-u' || $option eq '-h') {
+    print $usage;
+    exit 0;
+  } else {
+    print STDERR "$progname: Unknown option: '$option'\n\n$usage";
+    exit 4;
+  }
+}
+
+if (@ARGV == 0) {
+  print STDERR "$progname: No infile given on command line!\n\n $usage";
+  exit 3;
+}
+my $infile = shift @ARGV;
+my $outfile = undef;
+if (@ARGV == 1) {
+   $outfile = shift @ARGV;
+} elsif (@ARGV > 1) {
+  print STDERR "$progname: Too many arguments: ", join(' ', @ARGV), "\n";
+  exit 10;
+}
+
+
+my ($seqs, $names) = read_input($infile);
+
+if (@$names == 0) {
+  print STDERR "No sequences read from '$infile'!\n";
+  exit 8;
+}
+
+if ($remove_indel_columns) {
+  remove_gaps($seqs);
+}
+
+
+$SIG{PIPE} = 'IGNORE';
+my $fh;
+if ($debug) {
+  $fh = STDOUT;
+} elsif (defined $outfile) {
+  open($fh, "|$octave -q > $outfile")
+    or die "Could not call '$octave' and/or write to '$outfile'!\n";
+} else {
+  open($fh, "|$octave -q")
+    or die "Could not call '$octave'!\n";
+}
+write_octave_prologue($fh);
+write_octave_commands($fh, $seqs, $names);
+write_octave_ending($fh);
+close($fh) or die "Calculations failed, maybe there is not enough signal in the data?";
+
+exit 0;
+
+
+###########################################################
+__DATA__
+global Verbose     = 0;
+global LambdaPlots = 0;
+global WeightPlot  = 0;
+global MaxDistance = 400;
+global DistSamples = 1:5:MaxDistance;
+global MaxIterations = 10;
+
+#####################################################################################
+#
+# The iterative procedure
+#
+# The iteration stop when THRESHOLD is larger than the matrix norm
+# of the difference between two consecutive Q estimates.
+#
+# You can choose whether to use ML or
+# use EV to estimate the residue distribution. EV if
+# the third argument is 1 or something.
+#
+function [Q eq dv] = IterativeEstimation(Mlist, threshold, use_ev)
+  global MaxIterations;
+    iteration = 0;
+
+    # These are constant throughout the iterations
+    if (nargin == 2)
+	[Vl Vr eq] = FindEigensNotEq(Mlist);
+    elseif (nargin == 3)
+	[Vl Vr eq] = FindEigens(Mlist);
+    else
+	error ('Wrong number of arguments!');
+    endif
+
+    # Get a first simple estimate using a Jukes-Cantor model
+    posterior = comp_posterior_JC(Mlist);
+    [PW, W] = MatrixWeight(Mlist, posterior);
+    [Qnew eq] = EstimateQ(PW, W, Vl, Vr, eq, 100);
+ 
+    # Use this estimate to as a basis for improvement
+    do
+	iteration++;
+	Q = Qnew;
+	[Qnew difference] = SimpleEstimation(Mlist, Q, Vl, Vr, eq);
+	dv(iteration) = difference;
+    until (iteration >= MaxIterations ||  difference < threshold)
+
+    # Time to quit
+    Q = Qnew;
+endfunction
+
+function [Qnew d] = SimpleEstimation(Mlist, Qold, Vl, Vr, freq)
+    posterior = comp_posterior(Mlist, Qold, freq);
+    [PW, W] = MatrixWeight(Mlist, posterior);
+    Qnew = EstimateQ(PW, W, Vl, Vr, freq, 200);
+    d = norm(Qnew-Qold,"fro");
+endfunction 
+
+function PD = comp_posterior_JC(Mlist)
+    global DistSamples;
+
+    Mlen = length(Mlist);
+    PD = zeros(Mlen, columns(DistSamples));
+
+    for i = 1 : Mlen
+	M = Mlist{i};
+	l = jc_posterior_ng(M);
+	PD(i,:) = PD(i,:) + l;
+    endfor
+endfunction
+
+# Given an estimate of Q, compute posterior probabilities for all
+# distances for all seq pairs. 
+#
+# Similar to previous comp_posterior, but not re-computing matrix
+# exponentials all the time. 
+#
+function PD = comp_posterior(Mlist, Q, freq)
+    global DistSamples;
+
+    Mlen = length(Mlist);
+    PD = zeros(Mlen,columns(DistSamples));
+
+    prePt = precompute_expQ_vec(Q, freq);
+
+    for i=1:Mlen
+	M = Mlist{i};
+	l = my_posterior_pre(M, prePt);
+	PD(i,:) = PD(i,:) + l;
+    endfor
+endfunction
+
+function prePt = precompute_expQ_vec(Q, freq)
+    global DistSamples;
+
+    prePt = {};
+    for d = DistSamples
+	prePt(d) = log(diag(freq) * expm(Q*d));
+    endfor
+endfunction
+
+#
+# Compute the posterior probability of observing a set of replacements
+#
+# The integration code demands that the samples are uniformly distributed.
+# Numerical integration using simple linear interpolation. 
+#
+# prePt is a list of pre-computed matrices Pt=expm(Q*t).
+#
+function posterior_vec = my_posterior_pre(N, prePt)
+    global DistSamples;
+
+    l=[];
+
+    # Numerical integration, first data point,
+    p = loglik(N, prePt{DistSamples(1)});
+    ptot = p - log(2);
+    l(1) = p;
+
+    # middle datapoints
+    for i = 2 : (columns(DistSamples) - 1)
+	d = DistSamples(i);
+	p = loglik(N, prePt{d}); # log-prob!
+	ptot = logprob_add(ptot, p);
+	l(1,i) = p;
+    endfor
+
+    # last datapoint
+    i = columns(DistSamples);
+    p = loglik(N, prePt{DistSamples(i)});
+    ptot = logprob_add(ptot, p - log(2));
+    l(i) = p;
+
+    # 'multiply' each datapoint by sample 'width';
+    ptot = ptot + log(DistSamples(2) - DistSamples(1));
+
+    # setup return value
+    posterior_vec = exp(l .- ptot);
+endfunction
+
+function p = loglik(N, Pt)
+    p = sum(sum(N .* Pt));
+ endfunction
+
+#
+# Addition of log-probabilities
+#
+function logratio = logprob_add(p, q)
+  if (p < q)
+    logratio = q + log(1 + exp(p - q));
+  else
+    logratio = p + log(1 + exp(q - p));
+  endif
+endfunction
+
+#
+# Estimate eigenvectors of P (or Psum) and a residue distribution
+# based on counts. 
+function [Vl, Vr, eq] = FindEigens (Mlist, alpha)
+
+  if (nargin == 1)
+    alpha = 0;
+  endif
+
+  eq = ResidueDistr(Mlist);
+  Psum = EstimatePSum(Mlist, alpha);
+  [Vr, L] = eig(Psum);
+  [Vl, rcond] = inv(Vr);
+
+  if (rcond < 0.01)		# Bad solution, no doubt, let's reuse equilibrium
+    fdisp(stderr, "FindEigens: Bad condition number (%.5f)for inverse, aborting!", rcond);
+    quit;
+  endif
+				# Make P symmetric
+endfunction
+
+#
+# Using the sum of count matrices, estimate the sum of P matrices
+# 
+function Msum = EstimatePSum(Mlist, alpha)
+  Msum = GetSymmetricMatrixSum(Mlist, alpha);
+  Msum = NormalizeRows(Msum);
+endfunction
+
+
+#
+# Choose to estimate eq from eigen values instead of direct counts.
+#
+function [Vl, Vr, eq] = FindEigensNotEq(Mlist, alpha)
+  if (nargin == 1)
+    alpha = 0;
+  endif
+  [Vl Vr eq] = FindEigens(Mlist, alpha);
+  idx = FindPositiveRow(Vl);
+  eq = Vl(idx,:);
+  eq = eq ./ sum(eq);
+endfunction
+
+#
+# Estimate a residue distribution by counting all residues.
+# Use pseudo counts to avoid zero elements.
+#
+function eq = ResidueDistr(Mlist)
+  Msum = GetMatrixSum(Mlist);
+  eq = (Msum*ones(20,1))'+ones(1,20)*Msum;
+  eq = eq + ones(1,20);
+  eq = eq./ sum(eq);
+endfunction
+
+#
+# Sum all matrices in input list, but divide each matrix by
+# the sum of its elements. This estimates $\Pi * P(t_i)$.
+# Also make sure that the input is symmetric.
+#
+function Msum = GetSymmetricMatrixSum(Mlist, alpha)
+    Msum = zeros(20,20);
+    for i=1:length(Mlist)
+      M = Mlist{i};
+      M = M - alpha * tril(triu(M));
+      M = 0.5 * (M + M');
+      Msum = Msum + M;
+    endfor
+endfunction
+
+#
+# Ensure that each row in M sums to 1
+#
+function P = NormalizeRows (M)
+  v = M * ones(20,1);
+  P = diag(1 ./ v) * M;
+endfunction
+
+#
+# Find the index of the eigenvector corresponding to Q's zero eigenvalue.
+# This is recognized as the row (because we will be looking at the 'right'
+# eigenvectors, not the usual left) with all positive or all negative elements.
+#
+function idx = FindPositiveRow(Vl)
+  positives = sum(Vl > 0, 2); # Compute number of positive positions in each row
+  idx = find(positives == 20); # Find index of element with 20 positives
+  if (rows(idx) == 0)
+    idx = find(positives == 0);	# Find index of element with 0 positives
+  endif
+  if (rows(idx) > 1)
+    error ("FindPositiveRow: More than one candidate for null-vector!\n");
+  elseif (rows(idx) == 0)
+    error ("FindPositiveRow: No candidate for null-vector!\n");
+  endif
+endfunction
+
+    
+function posterior_vec = jc_posterior_ng(N)
+    global DistSamples;
+
+    tot = sum(sum(N));
+    diagonal = triu(tril(N));
+    k = sum(sum(diagonal));
+    p = exp(- DistSamples ./ 100);
+
+    likelihood = binomial_pdf(k, tot, p);
+    if (any(isnan(likelihood)))
+      # In case the binomial is tricky to compute, approx with normal distr!
+      likelihood = normal_pdf(k, tot .* p, tot .* p .* (1 .- p)); 
+    endif
+
+    n = columns(DistSamples);
+    likelihood(1) = likelihood(1) / 2;
+    likelihood(n) = likelihood(n) / 2;
+
+    posterior_vec = likelihood ./ (sum(likelihood) * (DistSamples(2) - DistSamples(1))) ;
+endfunction
+
+#
+# Weighting the count matrices.
+#
+# PW is a list, with the sum of count matrices weighted by their posterior probability
+# for evolutionary distance D. PW(D) is ...
+function [PW, W] = MatrixWeight(Mlist, posterior)
+    global WeightPlot;
+    global DistSamples;
+
+    PW = {};
+    W = [];
+    ettor = ones(1,length(Mlist));
+    for j = 1:columns(DistSamples)
+	d = DistSamples(j);
+	P = zeros(20,20);
+	for i = 1:length(Mlist)
+	    P = P + posterior(i, j) * Mlist{i};
+	endfor
+	PW(j) = NormalizeRows(P);
+	W(j) = ettor * posterior(:,j);
+#	printf('d = %d\t w(d) = %.4f\n', d, W(j));
+    endfor
+    if (WeightPlot==1)
+	plot(DistSamples, W, ';Weight;');
+    endif
+endfunction
+
+# 
+# Ah, just simply sum the lot!
+#
+function Msum = GetMatrixSum(Mlist)
+    Msum = zeros(20,20);
+    for i=1:length(Mlist)
+      M = Mlist{i};
+      Msum = Msum + M;
+    endfor
+endfunction
+
+global UseWeighting=1;
+
+function [Q eq] = EstimateQ(PW, W, Vl, Vr, eq, max_divergence)
+    global UseWeighting;
+    global Verbose;
+
+    if (UseWeighting == 1)
+	[L P X Y] = WeightedEstimateEigenvals(PW, W, Vl, Vr, max_divergence);
+    else
+	[L P X Y] = EstimateEigenvals(PW, W, Vl, Vr, 0.05, max_divergence);
+    endif
+    Q = RecoverQ(L, Vl, Vr);
+    Q = FixNegatives(Q);
+    Q = ReScale(Q, eq);
+
+endfunction
+
+function Q = RecoverQ(L, Vl, Vr)
+    Q = 0.01 * Vr * diag(L) * Vl;
+endfunction
+
+#
+# Alternative: Estimate eigenvalues of Q using weighted points
+#
+# The estimated eigenvalues are returned in L, and the equations are returned in X, Y
+#
+# max_divergence - only include P matrix estimates up to this pam distance
+function [L, M, X, Y] = WeightedEstimateEigenvals(PW, W, Vl, Vr, max_divergence)
+    global Verbose;
+    global LambdaPlots;
+    global DistSamples;
+
+    start=10;
+
+    # The X and Y matrises will contain 20 least-squares problems, one for each eigenvalue
+    X = [];
+    Y = [];
+    di = 1;
+
+    # Trying to improve eigenvectors, we pick out the sources for the eigenvalues
+    M = zeros(20, 20);
+
+    # Book keeping to detect bad data
+    npoints = zeros(20,1);
+
+    # Find the eigenvector corresponding to eigenvalue = 1
+    null_vector_idx = FindPositiveRow(Vl);
+
+    # Gather some datapoints
+    for i = 1 : columns(DistSamples)
+      d = DistSamples(i);
+      P = PW{i};
+      M = M + P;
+      ELAMBDA = diag(Vl * P * Vr);
+      weight = W(i);
+      for li = 1:20
+	if (li == null_vector_idx)
+	  continue;
+	endif
+	if (ELAMBDA(li) > 0) # Skip complex value data points!
+	  X(li, di) = d ./ 100 * weight;
+	  Y(li, di) = real(log(ELAMBDA(li))) * weight;
+#		    if (Y(li, di) != real(Y(li, di)))
+#			disp(strcat('Warning: Bad karma! lambda_', int2str(li), ' = ', num2str(ELAMBDA(li)), ' and the log is complex.'));
+#		    endif
+	  npoints(li)++;
+	else
+	  X(li, di) = 0; # No disturbance if set to 0!
+	  Y(li, di) = 0; #
+	endif
+      endfor
+      di++;
+    endfor
+
+    # Did it work?
+    for i=1:20
+	if (i != null_vector_idx && npoints(i) < 5) 
+	    fdisp(stderr, strcat('Error! Eigenvalue ', int2str(i), ' has only ', int2str(npoints(i)), ' datapoints.'));
+	    exit(1); # Error code
+	endif
+    endfor
+
+
+    # Now solve the 19 minimization problems
+    for i = 1:20
+      if (i == null_vector_idx)
+	L(i) = 0;
+      else
+	L(i) = X(i,:)' \ Y(i,:)';
+	if (L(i) != real(L(i)))
+	  fdisp(stderr, strcat('Eigenvalue ', int2str(i), ' was complex: ', num2str(L(i))));
+	  L(i) = real(L(i));
+	endif
+      endif
+    endfor
+    if (LambdaPlots == 1)
+      for col= 1:columns(X)
+	printf("%f\t%f\t%f\n", X(10,col), Y(10,col), Y(19,col));
+	endfor
+	hold on;
+	plot(X(19,:)', Y(19,:)', '@1;L19;');
+	plot(X(10,:)', Y(10,:)', '@2;L10;');
+	rightx = 1.1 * max(X(19,:));
+	rightx = max(rightx, 1.1 * max(X(10,:)));
+	plot([0,rightx],[0,rightx*L(19)], '1;;');
+	plot([0,rightx],[0,rightx*L(10)], '2;;');
+	printf("Rightx = %f, k10=%f, k19=%f\n", rightx, L(10), L(19));
+	hold off;
+	LambdaPlots = 0;
+    endif
+
+endfunction
+
+#
+# Sometimes, when data is sparse, Q estimates come out with 
+# off-diagonal entries being negative. Not good. 
+#
+function Q = FixNegatives(Qold)
+  global Verbose;
+
+  msize = rows(Qold);
+  # Get hold of negative off-diagonal entries
+  neg_entries = (Qold < 0) - eye(msize);
+
+  if (Verbose == 1 && neg_entries > 0) 
+    fdisp (stderr, strcat('  ', int2str(sum(sum(neg_entries))), ' negative entries fixed.'))
+  endif
+  
+  # I used to switch the sign on negative elements, like this:
+  ### Remove sign from negative entries by adding 2 times their magnitude
+  ###  Q = Qold - 2 * neg_entries .* Qold;
+
+  # What is the smallest positive entry?
+  minimum = min(min(abs(Qold)));
+
+  # Replace negative entries with the minimum elem
+  Q = Qold - (Qold .* neg_entries) + (minimum .* neg_entries);
+
+  # Update Q's diagonal
+  Q = Q - eye(msize) .* Q; # Set diagonal to zero
+  rowsums = sum(Q, 2); # The '2' chooses row sums over column sums
+  Q = Q - diag(rowsums);
+
+endfunction
+
+#
+# Scale Q so that the average mutation rate is 0.01
+#
+function Qnew = ReScale(Q, eq)
+  s = eq * (-diag(Q)) * 100;
+  Qnew = Q ./ s;
+endfunction
+
+#
+# Make sure that Pam10 represents an expected amount of 10 Percent Accepted Mutations
+#
+function Q = OldReScale(Q, eq)
+
+    iteration=1;
+    cur_scale = RateMatrixScale(Q, eq);
+    if (cur_scale == 0)
+      Q = eye(20);
+      return
+    endif
+    do 
+#	fprintf(stderr, "\tScaling iter %d\n", iteration);
+#	disp(strcat('  Current Q scaling: ', num2str(cur_scale)));
+	Q = Q / (10 * cur_scale);
+	cur_scale = RateMatrixScale(Q, eq);
+	iteration++;
+    until (abs(cur_scale-0.1) < 0.00001 || iteration > 10);
+    
+endfunction
+
+function s = RateMatrixScale(Q, eq)
+    diagonal = diag(expm(Q * 10));
+    s = eq * (ones(20,1) - diagonal);
+endfunction
+
+
+
+
+#
+# We want to be able to use the result in PAML
+#
+function write_for_paml(Q, eq)
+  R = Q * diag(ones(size(eq)) ./ eq);
+  for r = 2:20
+    for c = 1:(r-1)
+      printf('%f  ', R(r,c));
+    endfor
+    disp('');
+  endfor
+  disp('');
+  disp(eq);
+endfunction
+
+#
+# Interfacing with Fasta
+#
+function write_pam(Q, eq, d)
+  alph = 'ARNDCQEGHILKMFPSTWYV';
+  P250 = expm(Q * d);
+  M = round(10 * log(P250 * diag(1./eq)));
+  min_penalty = min(min(M));
+  disp(strcat('# Pam ', num2str));
+endfunction
