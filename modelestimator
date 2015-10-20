@@ -226,12 +226,7 @@ sub count_for_all_pairs {
 sub write_octave_prologue {
   my ($fh) = @_;
 
-  # For some reason, Octave does not allow 'script files' (as opposed to function files)
-  # to start with a function with a different name from the file. So on recommendation
-  # from the Octave manual, we add a pointless line to avoid warnings of our functions not
-  # agreeing with the filename '', i.e., the empty file name since the defs come from
-  # stdin.
-  print $fh "1; #Pointless line to convince Octave this is a script file.\nPS1=\"> \";split_long_rows=0;more off;format long\n";
+  print $fh "PS1=\"> \";split_long_rows=0;more off;format long\n";
 #  print $fh "StepSize = $speed;\n";
 
   while (<DATA>) {
