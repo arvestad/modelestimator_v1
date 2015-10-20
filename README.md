@@ -20,7 +20,7 @@ as the 'list' function must be supported.
 
 Please cite
 
-. Lars Arvestad, Efficient methods for estimating amino acid replacement
+  * Lars Arvestad, Efficient methods for estimating amino acid replacement
 rates, 2006, J Mol Evol, 62(6):663–673.
 
 if you use modelestimator!
