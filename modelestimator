@@ -34,7 +34,7 @@ Options:
    -threshold <f> Stop when consecutive iterations do not change by more
                   than <f>. Default is $threshold.
 
-   -paml          Output model for use with PAML.
+   -paml          Output model for use with PAML and PhyML.
    -fasta         Output substitution matrix (Pam250) for use with FastA.
 
    -v             Verbose. Show progress info on STDERR.
