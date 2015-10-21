@@ -332,7 +332,7 @@ if (@ARGV < 1) {
 
 my $remove_indel_columns = 0;
 
-while (substr($ARGV[0], 0, 1) eq '-') {
+while (scalar(@ARGV) && substr($ARGV[0], 0, 1) eq '-') {
   my $option = shift @ARGV;
   if ($option eq '-indels') {
     $remove_indel_columns = 1;
@@ -379,12 +379,13 @@ while (substr($ARGV[0], 0, 1) eq '-') {
   }
 }
 
+
 if (@ARGV == 0) {
   print STDERR "$progname: No infile given on command line!\n\n $usage";
   exit 3;
 }
 my $infile = shift @ARGV;
-if (@ARGV > 1) {
+if (@ARGV > 0) {
   print STDERR "$progname: Too many arguments: ", join(' ', @ARGV), "\n";
   exit 10;
 }
