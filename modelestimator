@@ -1,5 +1,7 @@
 #! /usr/bin/perl -w
 
+use File::Temp qw/ tempfile /; 
+
 #
 # Global variables
 #
@@ -22,7 +24,7 @@ my $octave = 'octave';
 my $prior = "flat_prior";
 my $debug = 0;			# If 1, write octave commands to output instead of to an octave process.
 
-my $usage = "Usage: $progname [<options>] <infile> [<outfile>]
+my $usage = "Usage: $progname [<options>] <infile>
 
 The infile should be in either FASTA, STOCKHOLM, or PHYLIP format.
 Output is a rate matrix and residue distribution vector, both in Octave/Matlab
@@ -226,7 +228,7 @@ sub count_for_all_pairs {
 sub write_octave_prologue {
   my ($fh) = @_;
 
-  print $fh "PS1=\"> \";split_long_rows=0;more off;format long\n";
+  print $fh "PS1(\"\");PS2(\"\"); split_long_rows=0;more off;format long\n";
 #  print $fh "StepSize = $speed;\n";
 
   while (<DATA>) {
@@ -382,10 +384,7 @@ if (@ARGV == 0) {
   exit 3;
 }
 my $infile = shift @ARGV;
-my $outfile = undef;
-if (@ARGV == 1) {
-   $outfile = shift @ARGV;
-} elsif (@ARGV > 1) {
+if (@ARGV > 1) {
   print STDERR "$progname: Too many arguments: ", join(' ', @ARGV), "\n";
   exit 10;
 }
@@ -404,20 +403,27 @@ if ($remove_indel_columns) {
 
 
 $SIG{PIPE} = 'IGNORE';
-my $fh;
+my $scripthandle;
+my $scriptfilename='/dev/stdout';
 if ($debug) {
-  $fh = STDOUT;
-} elsif (defined $outfile) {
-  open($fh, "|$octave -q > $outfile")
-    or die "Could not call '$octave' and/or write to '$outfile'!\n";
+    $scripthandle = STDOUT;
 } else {
-  open($fh, "|$octave -q")
-    or die "Could not call '$octave'!\n";
+    ($scripthandle, $scriptfilename) = tempfile();
 }
-write_octave_prologue($fh);
-write_octave_commands($fh, $seqs, $names);
-write_octave_ending($fh);
-close($fh) or die "Calculations failed, maybe there is not enough signal in the data?";
+
+write_octave_prologue($scripthandle);
+write_octave_commands($scripthandle, $seqs, $names);
+write_octave_ending($scripthandle);
+close($scripthandle);
+
+if ($debug) {
+    # Do nothing... 
+} else {
+    system($octave, '-q', $scriptfilename);
+    if ($? == -1) {
+	die "Computation failed. It could be a lack of signal in the data.\n";
+    }
+}
 
 exit 0;
 
@@ -924,8 +930,11 @@ function write_for_paml(Q, eq)
     endfor
     disp('');
   endfor
-  disp('');
-  disp(eq);
+  printf('\n');
+  for c = 1:20
+    printf('%f ', eq(c));
+  endfor
+  printf('\n')
 endfunction
 
 #
