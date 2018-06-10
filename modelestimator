@@ -260,6 +260,7 @@ sub write_octave_commands {
       $pair_id{$str} = $ids->{$n1}{$n2};
     }
   }
+  $ids{$nseqs-1} = undef;
 
   my @by_identity = sort {$pair_id{$b} <=> $pair_id{$a}} keys %pair_id;
   my $too_alike = 0;
